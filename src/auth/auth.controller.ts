@@ -4,13 +4,15 @@ import {
   Get,
   Body,
   UseGuards,
-  Request,
-  HttpStatus,
   HttpCode,
+  HttpStatus,
 } from '@nestjs/common';
 import { AuthService } from './auth.service';
-import { AuthGuard } from '@nestjs/passport';
-import { RegisterDto, LoginDto } from './dto';
+import { RegisterDto } from './dto/register.dto';
+import { LoginDto } from './dto/login.dto';
+import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
+import { CurrentUser } from '../common/decorators/current-user.decorator';
+import { type User } from 'generated/prisma/client';
 
 @Controller('auth')
 export class AuthController {
@@ -27,9 +29,9 @@ export class AuthController {
     return this.authService.login(dto);
   }
 
-  @UseGuards(AuthGuard('jwt'))
+  @UseGuards(JwtAuthGuard)
   @Get('me')
-  me(@Request() req) {
-    return this.authService.me(req.user.id);
+  me(@CurrentUser() user: User) {
+    return this.authService.me(user.id);
   }
 }
