@@ -5,6 +5,7 @@ import { AppModule } from './app.module';
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, {
     cors: true,
+    rawBody: true, // Enable raw body parsing for webhook verification
   });
 
   app.setGlobalPrefix('api/v1');
