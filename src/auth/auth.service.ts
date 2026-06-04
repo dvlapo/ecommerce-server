@@ -30,15 +30,28 @@ export class AuthService {
     // Hash password
     const hashedPassword = await argon2.hash(dto.password);
 
-    // Create user
-    const user = await this.prisma.user.create({
-      data: {
-        email: dto.email,
-        password: hashedPassword,
-        firstName: dto.firstName,
-        lastName: dto.lastName,
-        role: dto.role ?? 'CUSTOMER',
-      },
+    const user = await this.prisma.$transaction(async (tx) => {
+      const newUser = await tx.user.create({
+        data: {
+          email: dto.email,
+          password: hashedPassword,
+          firstName: dto.firstName,
+          lastName: dto.lastName,
+          role: dto.role ?? 'CUSTOMER',
+        },
+      });
+
+      // Auto-create vendor profile if registering as a vendor
+      if (dto.role === 'VENDOR') {
+        await tx.vendor.create({
+          data: {
+            userId: newUser.id,
+            storeName: `${newUser.firstName}'s Store`, // placeholder
+          },
+        });
+      }
+
+      return newUser;
     });
 
     return this.signToken(user.id, user.email);
