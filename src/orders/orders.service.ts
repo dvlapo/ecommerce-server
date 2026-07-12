@@ -6,6 +6,7 @@ import {
 } from '@nestjs/common';
 import { PrismaService } from '../database/prisma.service';
 import { InventoryService } from '../inventory/inventory.service';
+import { EmailService } from '../email/email.service';
 import { CreateOrderDto } from './dto';
 import { UpdateOrderStatusDto } from './dto';
 import { OrderStatus } from 'generated/prisma/enums';
@@ -15,6 +16,7 @@ export class OrdersService {
   constructor(
     private prisma: PrismaService,
     private inventoryService: InventoryService,
+    private emailService: EmailService,
   ) {}
 
   async create(userId: string, dto: CreateOrderDto) {
@@ -158,10 +160,35 @@ export class OrdersService {
       );
     }
 
-    return this.prisma.order.update({
+    const updatedOrder = await this.prisma.order.update({
       where: { id },
       data: { status: dto.status },
+      include: {
+        user: {
+          select: { email: true, firstName: true, lastName: true },
+        },
+      },
     });
+
+    if (updatedOrder.status === OrderStatus.CONFIRMED) {
+      await this.emailService.sendOrderConfirmed({
+        to: updatedOrder.user.email,
+        customerName: this.getCustomerName(updatedOrder.user),
+        orderId: updatedOrder.id,
+        totalAmount: updatedOrder.totalAmount.toString(),
+      });
+    }
+
+    if (updatedOrder.status === OrderStatus.SHIPPED) {
+      await this.emailService.sendOrderShipped({
+        to: updatedOrder.user.email,
+        customerName: this.getCustomerName(updatedOrder.user),
+        orderId: updatedOrder.id,
+        totalAmount: updatedOrder.totalAmount.toString(),
+      });
+    }
+
+    return updatedOrder;
   }
 
   async cancelMyOrder(id: string, userId: string) {
@@ -208,5 +235,9 @@ export class OrdersService {
       },
       orderBy: { createdAt: 'desc' },
     });
+  }
+
+  private getCustomerName(user: { firstName: string; lastName: string }) {
+    return `${user.firstName} ${user.lastName}`.trim();
   }
 }

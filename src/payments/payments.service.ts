@@ -8,6 +8,7 @@ import { PrismaService } from '../database/prisma.service';
 import { PaystackService } from './paystack.service';
 import { ConfigService } from '@nestjs/config';
 import { InitializePaymentDto } from './dto';
+import { EmailService } from '../email/email.service';
 import * as crypto from 'crypto';
 import { OrderStatus, PaymentStatus } from 'generated/prisma/enums';
 
@@ -17,6 +18,7 @@ export class PaymentsService {
     private prisma: PrismaService,
     private paystack: PaystackService,
     private config: ConfigService,
+    private emailService: EmailService,
   ) {}
 
   async initializePayment(userId: string, dto: InitializePaymentDto) {
@@ -113,25 +115,52 @@ export class PaymentsService {
 
     const payment = await this.prisma.payment.findFirst({
       where: { providerReference: reference },
+      include: {
+        order: {
+          include: {
+            user: true,
+          },
+        },
+      },
     });
 
     if (!payment) return;
 
-    await this.prisma.$transaction([
-      // Update payment status
-      this.prisma.payment.update({
+    const shouldSendPaymentSuccessful = payment.status !== PaymentStatus.SUCCESS;
+    const shouldConfirmOrder = payment.order.status === OrderStatus.PENDING;
+
+    await this.prisma.$transaction(async (tx) => {
+      await tx.payment.update({
         where: { id: payment.id },
         data: {
           status: PaymentStatus.SUCCESS,
           metadata: data,
         },
-      }),
-      // Confirm the order
-      this.prisma.order.update({
-        where: { id: metadata.orderId },
-        data: { status: OrderStatus.CONFIRMED },
-      }),
-    ]);
+      });
+
+      if (shouldConfirmOrder) {
+        await tx.order.update({
+          where: { id: metadata.orderId },
+          data: { status: OrderStatus.CONFIRMED },
+        });
+      }
+    });
+
+    const emailData = {
+      to: payment.order.user.email,
+      customerName: this.getCustomerName(payment.order.user),
+      orderId: payment.order.id,
+      totalAmount: payment.amount.toString(),
+      reference,
+    };
+
+    if (shouldSendPaymentSuccessful) {
+      await this.emailService.sendPaymentSuccessful(emailData);
+    }
+
+    if (shouldConfirmOrder) {
+      await this.emailService.sendOrderConfirmed(emailData);
+    }
   }
 
   private async handleRefund(data: any) {
@@ -197,5 +226,9 @@ export class PaymentsService {
       reference: paystackData.reference,
       paidAt: paystackData.paid_at,
     };
+  }
+
+  private getCustomerName(user: { firstName: string; lastName: string }) {
+    return `${user.firstName} ${user.lastName}`.trim();
   }
 }
