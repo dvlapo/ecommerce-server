@@ -376,6 +376,19 @@ export interface AdminAnalytics {
     averageRating: number | null;
   }>;
 }
+
+export interface UploadedProductImage {
+  url: string;
+  publicId: string;
+  width: number;
+  height: number;
+  format: string;
+  bytes: number;
+}
+
+export interface ProductImageUploadResponse {
+  images: UploadedProductImage[];
+}
 ```
 
 Use a decimal-aware formatter for display:
@@ -520,6 +533,68 @@ Creating a product also creates inventory with quantity `0`. The vendor must
 update inventory before customers can order it. Product deletion is a soft
 delete and can be reversed with `PATCH /products/:id` and
 `{ "isActive": true }`.
+
+### Product image uploads
+
+Product image uploads are handled separately from product create/update. Upload
+files first, then pass the returned Cloudinary URLs as `images` in
+`CreateProductInput` or `UpdateProductInput`.
+
+Cloudinary credentials are backend-only. Do not put `CLOUDINARY_CLOUD_NAME`,
+`CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET`, or any Cloudinary secret in the
+frontend environment.
+
+| Method | Path | Access | Request | Response | Notable errors |
+| --- | --- | --- | --- | --- | --- |
+| `POST` | `/uploads/product-images` | Vendor | `multipart/form-data` field `images`, max 5 files, max 5MB each, image MIME types only | `ProductImageUploadResponse` | `400`, `401`, `403`, `500` missing Cloudinary config or upload failure |
+
+The normal JSON `api()` helper sets `Content-Type: application/json`, so use a
+small dedicated helper for `FormData`. Let the browser set the multipart
+boundary; do not manually set `Content-Type`.
+
+```ts
+async function uploadProductImages(files: File[]) {
+  const form = new FormData();
+  files.forEach((file) => form.append("images", file));
+
+  const response = await fetch(`${API_URL}/uploads/product-images`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${tokenStore.get()}`,
+    },
+    body: form,
+  });
+
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({
+      statusCode: response.status,
+      message: response.statusText || "Upload failed",
+    }));
+    throw new ApiError(response.status, body);
+  }
+
+  return response.json() as Promise<ProductImageUploadResponse>;
+}
+
+async function createProductWithUploads(input: Omit<CreateProductInput, "images">, files: File[]) {
+  const uploaded = files.length
+    ? await uploadProductImages(files)
+    : { images: [] };
+
+  return api<Product>("/products", {
+    method: "POST",
+    auth: true,
+    body: {
+      ...input,
+      images: uploaded.images.map((image) => image.url),
+    },
+  });
+}
+```
+
+Show client-side validation before upload for a better experience, but treat
+the backend limits as authoritative. Product uploads are in scope; vendor logos
+and category images still use plain URL string fields.
 
 ## 6. Reviews
 
@@ -804,7 +879,7 @@ the UI, but continue to handle `403` because the backend guard is authoritative.
 
 - Approval-aware store dashboard.
 - Store profile editor.
-- Product list/editor with activation controls.
+- Product list/editor with image upload and activation controls.
 - Inventory table and low-stock view.
 
 ### Admin
@@ -848,8 +923,8 @@ unsubscribe endpoints in the current API.
 - Access tokens expire after 15 minutes; there is no refresh endpoint.
 - Logout is frontend-only token removal.
 - There is no cart or saved-cart endpoint.
-- There is no image upload endpoint; product image and logo fields accept
-  strings, so hosting/upload must be supplied separately.
+- Product image uploads exist, but vendor logos and category images still use
+  plain URL string fields.
 - There is no vendor-facing order list or fulfillment endpoint.
 - Admin order detail is blocked for orders owned by other users even though
   admin order listing is available.
