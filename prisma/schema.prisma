@@ -57,6 +57,8 @@ model User {
   lastName  String
   role      Role     @default(CUSTOMER)
   isActive  Boolean  @default(true)
+  refreshTokenHash      String?
+  refreshTokenExpiresAt DateTime?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 

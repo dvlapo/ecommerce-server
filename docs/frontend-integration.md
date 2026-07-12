@@ -48,23 +48,34 @@ Registration and login return:
 ```ts
 interface AuthResponse {
   access_token: string;
+  refresh_token: string;
 }
 ```
 
-The token expires after 15 minutes. There is currently no refresh-token or
-server-side logout endpoint. On `401 Unauthorized`, clear the local session and
-send the user to login. A frontend logout is simply local token removal.
+Access tokens expire after 15 minutes. Refresh tokens expire after 7 days and
+are rotated on every successful refresh. On `401 Unauthorized`, attempt one
+refresh with `POST /auth/refresh`; if refresh fails, clear the local session and
+send the user to login. Server-side logout is available at `POST /auth/logout`
+and revokes the stored refresh token for the current user.
 
 For a simple browser client, `sessionStorage` limits persistence to the current
 tab:
 
 ```ts
-const TOKEN_KEY = "ecommerce_access_token";
+const ACCESS_TOKEN_KEY = "ecommerce_access_token";
+const REFRESH_TOKEN_KEY = "ecommerce_refresh_token";
 
 export const tokenStore = {
-  get: () => sessionStorage.getItem(TOKEN_KEY),
-  set: (token: string) => sessionStorage.setItem(TOKEN_KEY, token),
-  clear: () => sessionStorage.removeItem(TOKEN_KEY),
+  getAccess: () => sessionStorage.getItem(ACCESS_TOKEN_KEY),
+  getRefresh: () => sessionStorage.getItem(REFRESH_TOKEN_KEY),
+  set: (tokens: AuthResponse) => {
+    sessionStorage.setItem(ACCESS_TOKEN_KEY, tokens.access_token);
+    sessionStorage.setItem(REFRESH_TOKEN_KEY, tokens.refresh_token);
+  },
+  clear: () => {
+    sessionStorage.removeItem(ACCESS_TOKEN_KEY);
+    sessionStorage.removeItem(REFRESH_TOKEN_KEY);
+  },
 };
 ```
 
@@ -93,7 +104,7 @@ Common statuses:
 | Status | Meaning | Frontend response |
 | --- | --- | --- |
 | `400` | Invalid input, stock failure, payment failure, or invalid order transition | Show the returned message near the action |
-| `401` | Missing, invalid, expired, or disabled-user token | Clear the session and require login |
+| `401` | Missing, invalid, expired, disabled-user access token, or invalid refresh token | Refresh once for authenticated API calls; if refresh fails, clear the session and require login |
 | `403` | Correctly authenticated but wrong role or resource owner | Show an access-denied state |
 | `404` | Entity or payment not found | Show a not-found state |
 | `409` | Duplicate email, category slug, vendor profile, or product review | Show the returned conflict message |
@@ -114,16 +125,42 @@ export class ApiError extends Error {
   }
 }
 
+async function refreshSession() {
+  const refreshToken = tokenStore.getRefresh();
+  if (!refreshToken) return false;
+
+  const response = await fetch(`${API_URL}/auth/refresh`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ refresh_token: refreshToken }),
+  });
+
+  if (!response.ok) {
+    tokenStore.clear();
+    return false;
+  }
+
+  tokenStore.set((await response.json()) as AuthResponse);
+  return true;
+}
+
 type ApiOptions = Omit<RequestInit, "body"> & {
   body?: unknown;
   auth?: boolean;
+  retryOnUnauthorized?: boolean;
 };
 
 export async function api<T>(
   path: string,
-  { body, auth = false, headers, ...init }: ApiOptions = {},
+  {
+    body,
+    auth = false,
+    retryOnUnauthorized = true,
+    headers,
+    ...init
+  }: ApiOptions = {},
 ): Promise<T> {
-  const token = tokenStore.get();
+  const token = tokenStore.getAccess();
 
   const response = await fetch(`${API_URL}${path}`, {
     ...init,
@@ -134,6 +171,19 @@ export async function api<T>(
     },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
+
+  if (response.status === 401 && auth && retryOnUnauthorized) {
+    const refreshed = await refreshSession();
+    if (refreshed) {
+      return api<T>(path, {
+        body,
+        auth,
+        headers,
+        retryOnUnauthorized: false,
+        ...init,
+      });
+    }
+  }
 
   if (!response.ok) {
     const fallback: ApiErrorBody = {
@@ -161,15 +211,17 @@ JSON response. Extend it before using it with a future `204 No Content` route.
 
 After registration or login:
 
-1. Store `access_token`.
+1. Store both `access_token` and `refresh_token`.
 2. Request `GET /auth/me`.
 3. Keep the returned user in React state.
 4. Render routes allowed by `user.role`.
 
-On application startup, request `/auth/me` only when a token exists. A failure
-should clear the token and leave the app unauthenticated. Subscribe to the
-`auth:unauthorized` event from the API helper so an expired token logs the user
-out consistently.
+On application startup, request `/auth/me` when an access token exists. If the
+access token is missing or expired but a refresh token exists, call
+`POST /auth/refresh`, store the rotated token pair, then request `/auth/me`.
+If refresh fails, clear both tokens and leave the app unauthenticated. Subscribe
+to the `auth:unauthorized` event from the API helper so an expired or revoked
+session logs the user out consistently.
 
 ```ts
 type AuthState =
@@ -414,6 +466,8 @@ payment amounts.
 | --- | --- | --- | --- | --- | --- |
 | `POST` | `/auth/register` | Public | `{ email, password, firstName, lastName, role? }` | `201`, `AuthResponse` | `400`, `409` email used |
 | `POST` | `/auth/login` | Public | `{ email, password }` | `200`, `AuthResponse` | `401` credentials or disabled account |
+| `POST` | `/auth/refresh` | Public | `{ refresh_token }` | `200`, `AuthResponse` with rotated refresh token | `400`, `401` invalid, expired, or revoked refresh token |
+| `POST` | `/auth/logout` | Authenticated | — | `{ message: "Logged out successfully" }` | `401` |
 | `GET` | `/auth/me` | Authenticated | — | Basic `AuthUser` without `isActive` or vendor | `401` |
 | `GET` | `/users/me` | Authenticated | — | `AuthUser` including vendor summary | `401`, `404` |
 | `PATCH` | `/users/me` | Authenticated | Any of `{ firstName, lastName, password }` | Updated profile | `400`, `401` |
@@ -437,8 +491,16 @@ async function login(email: string, password: string) {
     method: "POST",
     body: { email, password },
   });
-  tokenStore.set(result.access_token);
+  tokenStore.set(result);
   return api<AuthUser>("/users/me", { auth: true });
+}
+
+async function logout() {
+  await api<{ message: string }>("/auth/logout", {
+    method: "POST",
+    auth: true,
+  }).catch(() => undefined);
+  tokenStore.clear();
 }
 ```
 
@@ -560,7 +622,7 @@ async function uploadProductImages(files: File[]) {
   const response = await fetch(`${API_URL}/uploads/product-images`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${tokenStore.get()}`,
+      Authorization: `Bearer ${tokenStore.getAccess()}`,
     },
     body: form,
   });
@@ -920,8 +982,10 @@ unsubscribe endpoints in the current API.
 
 ## 13. Current integration limitations
 
-- Access tokens expire after 15 minutes; there is no refresh endpoint.
-- Logout is frontend-only token removal.
+- Access tokens expire after 15 minutes; refresh tokens expire after 7 days and
+  rotate on refresh.
+- Logout has a server endpoint, but the frontend should still clear local token
+  storage after calling it.
 - There is no cart or saved-cart endpoint.
 - Product image uploads exist, but vendor logos and category images still use
   plain URL string fields.
